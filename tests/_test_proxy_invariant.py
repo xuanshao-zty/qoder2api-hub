@@ -62,7 +62,11 @@ check("qoder_accounts.py 直连 urlopen 基线 == 0（出站统一走 _opener_fo
       n_direct == 0, n_direct)
 src_p = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 n_direct_p = src_p.count("urllib.request.urlopen(")
-check("qoder_proxy.py 直连 urlopen 基线 == 4（同上）", n_direct_p == 4, n_direct_p)
+# 出口代理功能落地后 4 -> 1：模型清单 / 更新检查 / 主链路的流式请求都改走
+# _opener_for_request()（面板代理 > 环境变量 > 直连）；剩下的 1 处是启动前
+# 探测本机 /health 的单实例检查（127.0.0.1，本来就不该走代理）。
+check("qoder_proxy.py 直连 urlopen 基线 == 1（只剩本机 /health 探测）",
+      n_direct_p == 1, n_direct_p)
 
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed" % (PASS + FAIL, PASS, FAIL))

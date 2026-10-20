@@ -23,6 +23,7 @@
 - **签到与保活**：自动领取每日 Credits 活动，定时刷新 Token
 - **防风控**：出站身份形态对齐官方客户端，可选的单号并发闸门与请求节奏控制，`/health` 提供排队 / 限流 / 拒绝信号遥测
 - **Web 看板**：账号、用量与性能指标、请求流水、限额护栏、智能体一键配置
+- **全局出口代理（本地定制）**：设置页粘贴 HTTP / SOCKS5 地址，支持用户名密码、连通测试、保存后热生效；详见[出口代理](docs/deployment.md#出口代理)
 - **零依赖**：只用 Python 标准库（COSY 签名、AES / RSA 都是纯 Python 实现），另提供 amd64 / arm64 Docker 镜像
 
 ## 快速开始
@@ -38,7 +39,8 @@ cd qoder2api-hub
 
 | 平台 | 启动 | 停止 |
 |---|---|---|
-| Windows | 双击 `start-qoder-proxy.bat`（后台运行，日志写入 `qoder-proxy.log`） | `stop-qoder-proxy.bat` |
+| Windows（控制面板，推荐） | 在安装目录双击 `Qoder2API.exe`；源码克隆后需先编译、部署（见 [Windows 说明](windows/README.md)） | 面板「停止」或 `windows\stop.cmd` |
+| Windows（命令行） | 双击 `start-qoder-proxy.bat`（后台运行，日志写入 `qoder-proxy.log`） | `stop-qoder-proxy.bat` |
 | Linux / macOS | `chmod +x *.sh && ./start-qoder-proxy.sh`（前台运行） | `Ctrl+C` |
 | Docker | `docker compose up -d` | `docker compose down` |
 
@@ -51,6 +53,7 @@ cd qoder2api-hub
 
 > Docker 以局域网模式启动，会强制使用 API Key。首次启动时自动生成，用 `docker compose logs qoder-proxy | grep -i "api key"` 查看。
 > 局域网共享、改端口、出口代理见[部署](docs/deployment.md)。
+> 本 Fork 的定制分支、源码与安装目录区别、编译步骤和敏感数据提交边界见[定制维护说明](docs/custom-build.md)。
 
 ## 接入客户端
 

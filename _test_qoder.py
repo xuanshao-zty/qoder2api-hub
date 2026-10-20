@@ -47,6 +47,21 @@ import qoder_catalog as C
 import qoder_accounts as A
 import qoder_tasks as T
 
+# 出口代理（qoder_netproxy）落地后，主链路 / 模型清单 / 更新检查改走
+# qoder_accounts._opener_for_request()，不再直接调 urllib.request.urlopen。
+# 本套测试用「桩 urllib.request.urlopen」模拟上游，这里把 opener 转发回
+# urlopen，让已有桩继续生效（测试关注业务行为；代理本身的回归测试见
+# tests/_test_outbound_proxy.py）。
+_ORIG_OPENER_FOR_TESTS = A._opener_for_request
+
+
+class _UrlopenBackedOpener(object):
+    def open(self, req, timeout=None):
+        return P.urllib.request.urlopen(req, timeout=timeout)
+
+
+A._opener_for_request = lambda: _UrlopenBackedOpener()
+
 PASS = FAIL = SKIP = 0
 
 
@@ -3901,8 +3916,12 @@ import tempfile as _tf36
 
 _NODE36 = _sh36.which("node")
 if not _NODE36:
-    for _cand36 in (r"C:\Users\shuishui\AppData\Local\nvm\v24.19.0\node.exe",):
-        if os.path.isfile(_cand36):
+    for _cand36 in (os.environ.get("NODE_EXE", ""),
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                 "Programs", "nodejs", "node.exe"),
+                    os.path.join(os.environ.get("ProgramFiles", ""),
+                                 "nodejs", "node.exe")):
+        if _cand36 and os.path.isfile(_cand36):
             _NODE36 = _cand36
             break
 _DASH36 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")

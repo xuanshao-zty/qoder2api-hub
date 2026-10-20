@@ -42,6 +42,8 @@ def _http_error(code, detail):
 def _run(pool, impl, realm="cn"):
     real_urllib, real_sessions, real_time, real_pool = (P.urllib, P.SESSIONS,
                                                          P.time, P.POOL)
+    real_opener = A._opener_for_request
+    A._opener_for_request = lambda: types.SimpleNamespace(open=impl)
     ft = types.SimpleNamespace(**dict((k, getattr(real_time, k))
                                       for k in dir(real_time)
                                       if not k.startswith("_")))
@@ -61,6 +63,7 @@ def _run(pool, impl, realm="cn"):
     except Exception as exc:
         return exc, None
     finally:
+        A._opener_for_request = real_opener
         P.urllib, P.SESSIONS, P.time, P.POOL = (real_urllib, real_sessions,
                                                 real_time, real_pool)
 

@@ -50,6 +50,7 @@ import qoder_accounts
 import qoder_agents
 import qoder_anthropic
 import qoder_catalog
+import qoder_netproxy
 import qoder_settings
 import qoder_sign
 import qoder_updater
@@ -2044,6 +2045,8 @@ def runtime_settings_view():
             "source": entry.get("source") or "panel",
             "created_at": entry.get("created_at") or "",
         })
+    env_proxies = qoder_accounts._proxy_map_from_env()
+    env_proxy_url = env_proxies.get("https") or env_proxies.get("http") or ""
     return {
         "panel_password_is_default":
             qoder_settings.panel_password_is_default(ACCOUNTS_DIR),
@@ -2059,6 +2062,12 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
+        "outbound_proxy": qoder_netproxy.describe_proxy(
+            qoder_settings.outbound_proxy(ACCOUNTS_DIR)),
+        "outbound_proxy_env": {
+            "set": bool(env_proxy_url),
+            "masked": qoder_netproxy.mask_proxy(env_proxy_url),
+        },
         "version": VERSION,
     }
 
@@ -2459,7 +2468,8 @@ def read_dynamic_models(realm=None):
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with qoder_accounts._opener_for_request().open(
+                    req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except Exception as exc:
@@ -3156,7 +3166,7 @@ def check_for_update(force=False):
             "Accept": "application/vnd.github+json",
             "User-Agent": "qoder-proxy-update-check",
         })
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with qoder_accounts._opener_for_request().open(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         tag = str(data.get("tag_name") or "").strip()
         info.update({
@@ -6017,7 +6027,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 req = urllib.request.Request(chat_url,
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=600)
+                resp = qoder_accounts._opener_for_request().open(
+                    req, timeout=600)
                 break
             except urllib.error.HTTPError as exc:
                 try:
@@ -8331,6 +8342,16 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             return
         reply = {}
+        proxy_value = None
+        if "outbound_proxy" in payload:
+            raw = payload.get("outbound_proxy")
+            if raw is not None and not isinstance(raw, str):
+                return self._error(400, "出口代理必须是字符串", "invalid_request_error")
+            try:
+                proxy_value = qoder_netproxy.normalize_proxy(raw)
+            except ValueError as exc:
+                return self._error(400, "出口代理地址无效：%s" % exc,
+                                   "invalid_request_error")
         if "api_keys" in payload:
             raw = payload.get("api_keys")
             if not isinstance(raw, list):
@@ -8429,6 +8450,14 @@ class Handler(BaseHTTPRequestHandler):
                 reply["limits_apply_error"] = str(exc)
                 log("quota limits apply failed after save: %s" % exc,
                     level="WARN")
+        if "outbound_proxy" in payload:
+            value = proxy_value
+            qoder_settings.set_outbound_proxy(ACCOUNTS_DIR, value)
+            qoder_accounts.clear_opener_cache()
+            reply["outbound_proxy"] = qoder_netproxy.describe_proxy(value)
+            log("outbound proxy %s" % (
+                "set to " + qoder_netproxy.mask_proxy(value) if value
+                else "cleared"), tag="settings")
         if payload.get("restart_scheduler"):
             if SCHEDULER:
                 SCHEDULER.stop()
@@ -9311,6 +9340,42 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/settings/proxy-test":
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            raw = str(payload.get("proxy") or "").strip()
+            probe_realm = CURRENT_REALM if CURRENT_REALM in ("cn", "intl") else "cn"
+            probe_url = (qoder_accounts.get_realm_config(probe_realm)["openapi"]
+                         + qoder_accounts.PATH_USERINFO)
+            try:
+                target = raw or qoder_settings.outbound_proxy(ACCOUNTS_DIR)
+                if target:
+                    target = qoder_netproxy.normalize_proxy(target)
+                    result = qoder_netproxy.proxy_test(target, probe_url=probe_url)
+                    result["source"] = "input" if raw else "panel"
+                    result["masked"] = qoder_netproxy.mask_proxy(target)
+                else:
+                    env = qoder_accounts._proxy_map_from_env()
+                    env_url = env.get("https") or ""
+                    result = qoder_netproxy.proxy_test(
+                        "", probe_url=probe_url,
+                        opener=qoder_accounts._opener_for_request())
+                    result["source"] = "environment" if env_url else "direct"
+                    result["direct"] = not bool(env_url)
+                    result["masked"] = qoder_netproxy.mask_proxy(env_url)
+            except (ValueError, OSError, qoder_netproxy.ProxyError) as exc:
+                return self._json(200, {"ok": False, "error": str(exc)})
+            result["realm"] = probe_realm
+            log("outbound proxy test %s [%s %s]: %s" % (
+                result["masked"], probe_realm, result.get("probe") or probe_url,
+                ("ok %dms HTTP %s" % (result["ms"], result.get("status", "?")))
+                if result.get("ok") else (result.get("error") or "failed")),
+                tag="settings")
+            return self._json(200, result)
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
@@ -9724,6 +9789,12 @@ def main():
                 "anyone on this network can log in and read your API key. "
                 "Change it in the panel, or restart with --panel-password.",
                 level="WARN")
+
+    # 面板出口代理：qoder_accounts 每次出站都现读（改完即时生效，见
+    # qoder_accounts._opener_for_request）。qoder_accounts 不反向依赖
+    # qoder_settings，所以这里注入 resolver。
+    qoder_accounts.set_proxy_resolver(
+        lambda: qoder_settings.outbound_proxy(ACCOUNTS_DIR))
 
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()

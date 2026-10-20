@@ -72,6 +72,16 @@ def _in_container():
         return False
 
 
+def _open(req, timeout):
+    """走与网关一致的出站代理（面板设置 > 环境变量 > 直连）。
+
+    独立调用、未注入面板 resolver 时仍遵循环境变量策略；
+    模块或配置故障必须报错，不能悄悄回退到系统代理或直连。
+    """
+    import qoder_accounts
+    return qoder_accounts._opener_for_request().open(req, timeout=timeout)
+
+
 def latest_release(timeout=8):
     """读 GitHub 最新 release（tag / 页面地址 / tarball 地址）。"""
     url = "https://api.github.com/repos/%s/releases/latest" % REPO
@@ -79,7 +89,7 @@ def latest_release(timeout=8):
         "Accept": "application/vnd.github+json",
         "User-Agent": "qoder-proxy-updater",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open(req, timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     tag = str(data.get("tag_name") or "").strip()
     if not tag:
@@ -91,7 +101,7 @@ def latest_release(timeout=8):
 
 def _download(url, dest, timeout=120):
     req = urllib.request.Request(url, headers={"User-Agent": "qoder-proxy-updater"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:
+    with _open(req, timeout) as resp, open(dest, "wb") as fh:
         shutil.copyfileobj(resp, fh)
     return dest
 

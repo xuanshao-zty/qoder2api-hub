@@ -1,0 +1,18 @@
+# PUBLIC TEST FIXTURE ONLY. This certificate/key must never secure a real service.
+# OpenSSL is used once to create the committed PEM files, never by the test suite.
+[req]
+prompt = no
+distinguished_name = test_subject
+x509_extensions = test_extensions
+
+[test_subject]
+CN = probe.invalid
+O = Public offline proxy regression fixture
+
+[test_extensions]
+subjectAltName = DNS:probe.invalid
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,digitalSignature,keyEncipherment,keyCertSign,cRLSign
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always

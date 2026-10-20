@@ -1049,6 +1049,35 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </section>
 
     <section>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">出口代理 <em id="setProxyState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px">
+            网关访问 Qoder 上游（含签到、刷新令牌、模型清单）时走的出口。保存后立即生效，无需重启。
+          </div>
+        </div>
+      </div>
+      <div id="setProxyStateText" style="font-size:12px;color:var(--dim);margin-bottom:10px">读取中…</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+        <div style="flex:1;min-width:280px">
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">代理地址</div>
+          <input id="setProxyUrl" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="http://user:pass@192.168.0.2:7890 或 socks5://user:pass@host:1080"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+        </div>
+        <button onclick="saveOutboundProxy(this)">保存</button>
+        <button class="sec" onclick="testOutboundProxy(this)">测试</button>
+        <button class="sec" onclick="clearOutboundProxy(this)">清除</button>
+      </div>
+      <div id="setProxyResult" style="font-size:12px;color:var(--dim);margin-top:8px"></div>
+      <div class="legend" style="margin-top:10px">
+        <span>支持 <span class="mono">http://</span> / <span class="mono">socks5://</span> / <span class="mono">socks5h://</span>；HTTP 代理也支持访问 HTTPS 上游</span>
+        <span>用户名密码直接写在地址里；密码含 @、:、/、# 等特殊字符时请先做 URL 编码</span>
+        <span>环境变量 <span class="mono">HTTPS_PROXY</span> 仍然生效，但面板里的设置优先</span>
+      </div>
+    </section>
+
+    <section>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
           <h2 style="margin:0">API Key 与出口绑定 <em id="setKeyState"></em></h2>
@@ -3636,6 +3665,7 @@ async function loadSettings(showToast){
     set('setUsageDir', data.usage_dir);
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
+    renderProxyState(data);
     renderLimits(data.limits || null);   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
@@ -3660,6 +3690,96 @@ async function savePanelPassword(btn){
     loadSettings();
   } catch(e) {
     toast('修改失败: ' + e.message, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---- 出口代理：面板设置 > 环境变量 > 直连 ---- */
+let OUTBOUND_PROXY = { set: false };
+
+function renderProxyState(data){
+  OUTBOUND_PROXY = (data && data.outbound_proxy) || { set: false };
+  const env = (data && data.outbound_proxy_env) || {};
+  const state = document.getElementById('setProxyState');
+  const input = document.getElementById('setProxyUrl');
+  const text = document.getElementById('setProxyStateText');
+  let current;
+  if(OUTBOUND_PROXY.set){
+    current = '当前出口：' + (OUTBOUND_PROXY.masked || '已设置') + '（面板设置）';
+    if(input){ input.value = ''; input.placeholder = '已设置 ' + (OUTBOUND_PROXY.masked || '') + '，留空表示不修改'; }
+  } else if(env.set){
+    current = '当前出口：' + env.masked + '（来自环境变量）';
+    if(input){ input.value = ''; input.placeholder = env.masked + '（环境变量，面板设置会覆盖它）'; }
+  } else {
+    current = '当前出口：直连（未设置代理）';
+    if(input){ input.value = ''; input.placeholder = 'http://user:pass@192.168.0.2:7890 或 socks5://user:pass@host:1080'; }
+  }
+  if(text) text.textContent = current;
+  if(state){
+    state.textContent = OUTBOUND_PROXY.set ? '(已设置)' : (env.set ? '(环境变量)' : '(直连)');
+    state.style.color = (OUTBOUND_PROXY.set || env.set) ? 'var(--accent2)' : 'var(--dim)';
+  }
+}
+
+async function saveOutboundProxy(btn){
+  const input = document.getElementById('setProxyUrl');
+  const value = ((input || {}).value || '').trim();
+  if(!value){ toast('请填写代理地址；「清除」将恢复环境变量或直连', 'warn'); return; }
+  btn.disabled = true;
+  try {
+    const data = await postJSON('/settings/save', { outbound_proxy: value });
+    if(input) input.value = '';
+    renderProxyState(data);
+    toast('出口代理已保存，下一次上游请求生效', 'ok');
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function clearOutboundProxy(btn){
+  btn.disabled = true;
+  try {
+    const data = await postJSON('/settings/save', { outbound_proxy: '' });
+    const box = document.getElementById('setProxyResult');
+    if(box){ box.textContent = ''; }
+    renderProxyState(data);
+    toast('已清除出口代理', 'ok');
+  } catch(e) {
+    toast('清除失败: ' + e.message, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function testOutboundProxy(btn){
+  const input = document.getElementById('setProxyUrl');
+  const value = ((input || {}).value || '').trim();
+  const box = document.getElementById('setProxyResult');
+  btn.disabled = true;
+  if(box){ box.textContent = '测试中…'; box.style.color = 'var(--dim)'; }
+  try {
+    const data = await postJSON('/settings/proxy-test', { proxy: value });
+    if(box){
+      const target = data.probe ? '；探测：' + data.probe : '';
+      const region = data.realm === 'intl' ? '（国际版）' : (data.realm === 'cn' ? '（国内版）' : '');
+      if(data.ok){
+        box.textContent = (data.direct ? '直连探测成功' : '代理链路可达') + region
+          + '，耗时 ' + data.ms + ' ms' + (data.status ? '，HTTP ' + data.status : '')
+          + (data.masked ? '（' + data.masked + '）' : '') + target
+          + (data.message ? '；' + data.message : '');
+        box.style.color = 'var(--accent2)';
+      } else {
+        box.textContent = '测试失败' + region + '：' + (data.error || '未知错误') + target;
+        box.style.color = 'var(--warn)';
+      }
+    }
+    toast(data.ok ? '代理测试通过' : ('代理测试失败：' + (data.error || '')), data.ok ? 'ok' : 'bad');
+  } catch(e) {
+    if(box){ box.textContent = '测试失败：' + e.message; box.style.color = 'var(--warn)'; }
+    toast('测试失败: ' + e.message, 'bad');
   } finally {
     btn.disabled = false;
   }

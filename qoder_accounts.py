@@ -29,6 +29,7 @@ import urllib.request
 from pathlib import Path
 import uuid
 
+import qoder_netproxy
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
@@ -1193,14 +1194,76 @@ def _proxy_map_from_env():
     return out
 
 
-def _opener_for_request():
-    """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
+# 面板里设置的出口代理（settings.json → outbound_proxy）。由 qoder_proxy 在
+# 启动时注入 resolver，qoder_accounts 不反过来依赖 qoder_settings，避免循环导入。
+_PROXY_RESOLVER = None
+_PROXY_RESOLVER_LOCK = threading.Lock()
 
-    「现建」是对 #27 固化行为的修复——默认 opener（urllib.request.urlopen）
-    首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
+# opener 可以跨线程复用（每次请求内部新建 HTTP 连接），按「代理串」缓存；
+# 设置变了 key 就变，自然换新 opener，不需要重启网关。
+_OPENER_CACHE = {}
+_OPENER_CACHE_LOCK = threading.Lock()
+_OPENER_CACHE_MAX = 8
+
+
+def set_proxy_resolver(resolver):
+    """注入「读取面板出口代理」的函数（返回代理 URL；空串 = 未设置）。
+
+    qoder_proxy 启动时调用：``set_proxy_resolver(lambda: ...outbound_proxy...)``。
     """
+    global _PROXY_RESOLVER
+    with _PROXY_RESOLVER_LOCK:
+        _PROXY_RESOLVER = resolver
+    clear_opener_cache()
+
+
+def clear_opener_cache():
+    """丢弃缓存 opener（面板改完代理后调用，让新设置立刻生效）。"""
+    with _OPENER_CACHE_LOCK:
+        _OPENER_CACHE.clear()
+
+
+def _proxy_override():
+    """未注入 resolver 表示未设置；读取故障不得悄悄改成直连。"""
+    resolver = _PROXY_RESOLVER
+    if resolver is None:
+        return ""
+    try:
+        return str(resolver() or "").strip()
+    except Exception:
+        raise qoder_netproxy.ProxyError("无法读取出口代理设置，请检查 settings.json") from None
+
+
+def _cached_opener(key, factory):
+    with _OPENER_CACHE_LOCK:
+        opener = _OPENER_CACHE.get(key)
+    if opener is not None:
+        return opener
+    opener = factory()
+    with _OPENER_CACHE_LOCK:
+        if len(_OPENER_CACHE) >= _OPENER_CACHE_MAX:
+            _OPENER_CACHE.clear()
+        _OPENER_CACHE[key] = opener
+    return opener
+
+
+def _opener_for_request():
+    """按当前配置取 opener：面板出口代理 > 环境变量 > 直连。
+
+    面板代理填错时 ``build_opener`` 会抛（ValueError / ProxyError），**不静默
+    直连**——那等于绕过用户明确指定的出口。调用点按网络错误处理并展示原因。
+    """
+    override = _proxy_override()
+    if override:
+        return _cached_opener(
+            "proxy:" + override,
+            lambda: qoder_netproxy.build_opener(override))
     proxies = _proxy_map_from_env()
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    env_key = "|".join("%s=%s" % item for item in sorted(proxies.items()))
+    return _cached_opener(
+        "env:" + env_key,
+        lambda: urllib.request.build_opener(
+            urllib.request.ProxyHandler(proxies)))
 
 
 def upstream_clock_skew(timeout=4.0):

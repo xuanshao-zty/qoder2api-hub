@@ -35,18 +35,21 @@ def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
     ).hex()
 
 
-def load(accounts_dir):
-    """Return the persisted settings, or an empty dict on a fresh install."""
+def load(accounts_dir, strict=False):
+    """Return persisted settings; strict callers must not bypass corrupt config."""
     path = settings_path(accounts_dir)
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict):
             return data
+        if strict:
+            raise ValueError("settings.json 必须为 JSON 对象")
     except FileNotFoundError:
         pass
     except Exception:
-        pass
+        if strict:
+            raise ValueError("无法读取 settings.json，请检查文件内容和权限") from None
     return {}
 
 
@@ -107,6 +110,29 @@ def set_panel_password(accounts_dir, password):
             data["panel_password_hash"] = _digest(password, salt)
             data["panel_password_default"] = False
         save(accounts_dir, data)
+
+
+def outbound_proxy(accounts_dir):
+    """Panel-configured outbound proxy URL ("" = not set).
+
+    The value is stored already normalized by the caller
+    (qoder_netproxy.normalize_proxy); qoder_accounts reads it on every request
+    so a change in the panel takes effect without restarting the gateway.
+    """
+    return str(load(accounts_dir, strict=True).get("outbound_proxy") or "").strip()
+
+
+def set_outbound_proxy(accounts_dir, value):
+    """Persist (or clear, with an empty value) the outbound proxy URL."""
+    value = str(value or "").strip()
+    with _lock:
+        data = load(accounts_dir, strict=True)
+        if value:
+            data["outbound_proxy"] = value
+        else:
+            data.pop("outbound_proxy", None)
+        save(accounts_dir, data)
+    return value
 
 
 def api_key_override(accounts_dir):

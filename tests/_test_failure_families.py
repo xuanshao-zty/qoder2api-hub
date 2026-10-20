@@ -129,6 +129,8 @@ def _run_open_upstream(pool, urlopen_impl, realm="cn"):
     real_sessions = P.SESSIONS
     real_time = P.time
     real_pool = P.POOL
+    real_opener = A._opener_for_request
+    A._opener_for_request = lambda: types.SimpleNamespace(open=urlopen_impl)
     fake_time = types.SimpleNamespace(
         **dict((k, getattr(real_time, k)) for k in dir(real_time)
                if not k.startswith("_")))
@@ -147,6 +149,7 @@ def _run_open_upstream(pool, urlopen_impl, realm="cn"):
     except Exception as exc:
         err = exc
     finally:
+        A._opener_for_request = real_opener
         P.urllib = real_urllib
         P.SESSIONS = real_sessions
         P.time = real_time

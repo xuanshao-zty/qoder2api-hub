@@ -117,6 +117,8 @@ def _stub59(pool, urlopen_impl):
     """桩 urlopen / SESSIONS / time.sleep；返回还原函数。"""
     real_urllib, real_sessions, real_time, real_pool = (
         P.urllib, P.SESSIONS, P.time, P.POOL)
+    real_opener = A._opener_for_request
+    A._opener_for_request = lambda: types.SimpleNamespace(open=urlopen_impl)
     fake_time = types.SimpleNamespace(
         **dict((k, getattr(real_time, k)) for k in dir(real_time)
                if not k.startswith("_")))
@@ -131,6 +133,7 @@ def _stub59(pool, urlopen_impl):
     P.POOL = pool
 
     def _restore():
+        A._opener_for_request = real_opener
         P.urllib = real_urllib
         P.SESSIONS = real_sessions
         P.time = real_time
