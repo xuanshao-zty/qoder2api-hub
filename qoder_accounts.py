@@ -1493,6 +1493,10 @@ class Account(object):
             "userType": self.user_type,
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
+            # issue #74：#69 只给 to_dict（写文件/导出）加了 note，public()
+            # （面板 /accounts 的数据源）漏了——保存后当场能看见，15 秒后
+            # 轮询覆盖就消失。纯展示字段，加进来没有副作用。
+            "note": self.note,
         }
 
     def save(self, directory):

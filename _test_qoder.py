@@ -2577,7 +2577,8 @@ try:
     P._handle_envelope_account_cooldown(_acc26, _UpErr26(
         403, '{"code":"10605","message":"{\"isQueued\":true,\"retryAfterSeconds\": 30}"}'),
         model="qfmodel", session_key="sk-pr7")
-    _n1 = _acc26.notes[-1]
+    _n1 = _acc26.notes[-1] if _acc26.notes else None
+    _aff_after_queue = list(P.POOL.affinity.calls)
     P._handle_envelope_account_cooldown(_acc26, _UpErr26(403, "permission denied"),
                                         model="qfmodel", session_key="sk-pr7")
     _n2 = _acc26.notes[-1]
@@ -2591,10 +2592,10 @@ try:
     _aff26_calls = list(P.POOL.affinity.calls)
 finally:
     P.POOL = _orig_pool26
-check("10605 排队 -> 模型级冷却 30s（按上游 retryAfterSeconds）+ 解绑会话",
-      _n1["cooldown"] == 30 and _n1["model"] == "qfmodel"
-      and set(_aff26_calls) == {"sk-pr7"} and len(_aff26_calls) >= 1,
-      (_n1, _aff26_calls))
+# issue #71：排队不再惩罚账号（不冷却、不解绑）——冷却会把单号池打成
+# 「no usable account」，面板看起来就是凭证失效。
+check("10605 排队 -> 不再冷却账号 / 不解绑会话（issue #71）",
+      _n1 is None and not _aff_after_queue, (_n1, _aff_after_queue))
 check("403 非排队 -> 账号级冷却 60s", _n2["cooldown"] == 60 and _n2["model"] is None, _n2)
 check("429 -> 模型级冷却 30s", _n3["cooldown"] == 30 and _n3["model"] == "qfmodel", _n3)
 check("死会话 -> 300s + 停用账号（与 open_upstream 同语义）",

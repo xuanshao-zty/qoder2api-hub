@@ -59,7 +59,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.14"
+VERSION = "1.6.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2359,8 +2359,12 @@ def read_local_models(realm=None):
                 log("model catalog read from local client cache: %d models (%s)"
                     % (len(out), r))
                 return out
+    except FileNotFoundError:
+        # issue #74 补充：容器 / 未装官方客户端时 ~/.qoder/.models/default 天然
+        # 不存在，这是**正常降级**（最终回落到内嵌快照），不该刷 WARN 让人误判。
+        pass
     except Exception as exc:
-        log("local model catalog read skipped: %s" % exc)
+        log("local model catalog read skipped: %s" % exc, level="DEBUG")
     return []
 
 
@@ -3548,6 +3552,39 @@ def _log_unrecovered_leak(text, where="chat"):
         pass
 
 
+EMPTY_ECHO_ERROR_DETAIL = (
+    "upstream returned only a truncated tool-call echo (no usable call); "
+    "the turn was failed on purpose so the client retries instead of "
+    "silently treating the task as finished (issue #72)"
+)
+
+
+def _echo_names_declared(text, allowed_names):
+    """回声里出现的工具名**全部**在本次声明集合里（issue #72 收紧判据）。
+
+    只按「声明了 tools」就 fail-closed 太宽：模型复述**未声明**工具时我们本来就
+    恢复不了（#27），把它判成失败会误伤一批正常回合。
+    """
+    if not allowed_names:
+        return False
+    names = re.findall(r'"name"\s*:\s*"([^"]{1,120})"', str(text or ""))
+    if not names:
+        return False
+    return all(n in allowed_names for n in names)
+
+
+def _marker_only_echo(text):
+    """整段除了泄漏标记之外什么都没有（issue #72 的退化形态）。"""
+    if not str(text or "").strip():
+        return False
+    t = _normalize_leak_marker(str(text or "").strip())
+    rest = t
+    while rest.startswith(LEAK_MARKER):
+        rest = rest[len(LEAK_MARKER):].lstrip()
+    rest = _strip_dsml_close_tail(rest).strip()
+    return rest == ""
+
+
 class InvalidToolArguments(UpstreamStatus):
     """已确认是工具协议回声，但内层 arguments 不是合法 JSON（issue #37）。
 
@@ -3563,6 +3600,20 @@ class InvalidToolArguments(UpstreamStatus):
 
     def __init__(self):
         super(InvalidToolArguments, self).__init__(502, BAD_ARGS_ERROR_DETAIL)
+
+
+class EmptyToolEcho(InvalidToolArguments):
+    """模型本轮只吐了工具协议回声、没有可用调用（issue #72）。
+
+    继承 InvalidToolArguments：四条协议出口（chat 流式 / Responses / Anthropic /
+    非流式 502）已经统一按 fail-closed 处理，重试与账号冷却入口也显式排除。
+    区别只是错误文案——告诉客户端「这是残缺回声，请重试」，而不是让它误判完成。
+    """
+
+    def __init__(self, chars=0, kind="marker_only"):
+        UpstreamStatus.__init__(
+            self, 502, "%s [%d chars, %s]" % (EMPTY_ECHO_ERROR_DETAIL,
+                                             int(chars), kind))
 
 
 _JSON_FENCE = chr(96) * 3
@@ -4428,8 +4479,17 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 level="WARN", tag="chat")
             raise InvalidToolArguments()
         elif _leaked_partial_droppable(hold, allowed_names):
-            # issue #9：截断的 marker+JSON 回声无法还原成结构化调用，吞掉整段，
-            # 绝不把网关内部协议文本透传给终端用户。
+            # issue #72：**不要把「残缺工具回声」当成功结束**。此前吞掉后按
+            # stop 收尾，coding agent 会认为任务做完了（静默中断，比报错更难查）。
+            # 客户端声明了 tools 且本轮没有一个可用调用 -> fail-closed，让客户端重试。
+            if allowed_names and _marker_only_echo(hold):
+                _kind = "marker_only" if _marker_only_echo(hold) else "partial_array"
+                log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                    "tools_declared=%d) — failing the turn closed (issue #72)"
+                    % (len(hold), _kind, len(allowed_names)),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(hold), _kind)
+            # issue #9：未声明工具时仍按原样吞掉（无可恢复的调用可言）
             log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
                 % len(hold), level="WARN", tag="chat")
         elif _tool_echo_droppable(hold, allowed_names):
@@ -4437,6 +4497,11 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(hold), level="WARN", tag="chat")
+        elif _marker_only_echo(hold):
+            # 只有标记、没有任何内容：无论如何都不该透传给终端用户
+            # （未声明 tools 时无法确认是回声，但「一个孤零零的标记」没有信息量）。
+            log("dropped bare tool-call marker (%d chars) — issue #72" % len(hold),
+                level="WARN", tag="chat")
         else:
             # issue #49 方向 C：认不出但**看起来就是协议回声**的，必须留痕。
             _log_unrecovered_leak(hold, "stream")
@@ -5250,7 +5315,7 @@ TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退�
 # （QODER_MODEL_QUEUE_MAX_WAIT_MS=3600000），每轮 sleep retryAfterSeconds。
 # 网关是同步 HTTP，不能真等 60 分钟；这里给分钟级预算（默认 10 分钟 / 6 轮），
 # 仍可用 QD_QUEUE_* 覆盖。
-QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 6)
+QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 3)
 QUEUE_WAIT_MAX_SECS = int(os.environ.get("QD_QUEUE_WAIT_MAX_SECS") or 180)
 QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 600)
 QUEUE_WAIT_JITTER_SECS = float(os.environ.get("QD_QUEUE_WAIT_JITTER") or 2.0)
@@ -5521,6 +5586,16 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         return
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
+    # issue #71：排队**不是账号问题**——必须在解绑会话/冷却之前短路，
+    # 否则单号池会被打成「no usable account」，面板看起来就是凭证失效。
+    _is_queue71 = ("10605" in detail or "isQueued" in detail)
+    if _is_queue71 and status_int in (401, 403) \
+            and not qoder_accounts.session_dead(detail):
+        note_risk("queue", detail)
+        log("account %s queued via envelope (HTTP %s) - not penalising the "
+            "account (issue #71)" % (account.uid[:8], status_int),
+            level="WARN", tag="chat")
+        return
     if session_key and POOL:
         try:
             POOL.affinity.unbind(session_key)
@@ -5549,7 +5624,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         # 10605 排队冷却为模型级或账号级
         is_queue = "10605" in detail or "isQueued" in detail
         note_risk("queue" if is_queue else "rejected", detail)
-        cd = 300 if dead else (retry_secs if is_queue else 60)
+        cd = 300 if dead else 60
         actual = account.note_error("envelope HTTP %s: %s"
                                     % (status_int, detail[:80]),
                                     cooldown=cd, single_account=(total <= 1),
@@ -5570,6 +5645,58 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         # 请求内容的确定性拒绝，不代表账号有问题）；单号池不接（total<=1）。
         if total > 1 and not any(m in detail for m in _CLIENT_FAULT_MARKERS):
             account.note_unknown_failure("envelope HTTP %s" % status_int)
+
+def _alt_realm_ready(realm, model=""):
+    """另一个区是否还有可用账号（issue #71 跨区 failover 用）。"""
+    other = "intl" if realm == "cn" else "cn"
+    try:
+        return other if _realm_ready_total(other, model) > 0 else ""
+    except Exception:
+        return ""
+
+
+def _envelope_queue_action(exc, realm, model, state):
+    """排队信封的下一步（issue #71）：failover / wait / giveup。
+
+    返回 (action, target_realm, wait_secs)。state 是每个请求一份的字典：
+    {rounds, deadline, switched}。三条规则：
+      1. 另一区有就绪账号 -> 先跨区试一次（排队是区域+模型维度，本次现场就是
+         cn 排队而 intl 同模型 200）；
+      2. 否则按 retryAfterSeconds 等，但总轮次/总时长受请求级预算约束；
+      3. 预算耗尽 -> giveup，由调用方转成 429 + Retry-After（不是 403）。
+    """
+    q = _envelope_queue_wait(exc)
+    if q <= 0:
+        return "wait", "", 0
+    if not state.get("switched"):
+        alt = _alt_realm_ready(realm, model)
+        if alt:
+            state["switched"] = True
+            return "failover", alt, 0
+    state["rounds"] = int(state.get("rounds") or 0) + 1
+    if state["rounds"] > QUEUE_MAX_ROUNDS \
+            or time.time() > float(state.get("deadline") or 0):
+        return "giveup", "", q
+    if q > QUEUE_WAIT_MAX_SECS:
+        return "giveup", "", q
+    return "wait", "", min(q + 1, QUEUE_WAIT_MAX_SECS)
+
+
+def _as_rate_limited_for_queue(exc, model=""):
+    """排队类信封错误 -> RateLimited（429 + Retry-After）；其它原样返回。
+
+    issue #71：排队最终以 403 抛给客户端，很容易被当成凭证失效。
+    """
+    q = _envelope_queue_wait(exc) if exc is not None else 0
+    if q <= 0:
+        return exc
+    return RateLimited(None, getattr(exc, "detail", "") or "", wait=q)
+
+
+def _queue_budget():
+    """日志里显示的「本轮上限」：排队按 QUEUE_MAX_ROUNDS，其余按瞬时重试数。"""
+    return max(TRANSIENT_MAX_RETRIES + 1, QUEUE_MAX_ROUNDS)
+
 
 def _envelope_queue_wait(exc):
     """信封层排队信号 -> 建议等待秒数（issue #38 后续 / #51 补充）。
@@ -5642,11 +5769,12 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
             except UpstreamStatus as exc:
                 _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                 if not should_retry_envelope(exc, False, attempt):
-                    raise
+                    # issue #71：排队耗尽 -> 429 + Retry-After（不是 403）
+                    raise _as_rate_limited_for_queue(exc, model)
                 log("in-stream envelope status %s on model '%s' "
                     "(try %d/%d), reopening upstream"
-                    % (exc.status, model, attempt + 1,
-                       TRANSIENT_MAX_RETRIES + 1), level="WARN", tag="chat")
+                    % (exc.status, model, min(attempt + 1, _queue_budget()),
+                       _queue_budget()), level="WARN", tag="chat")
                 time.sleep(_envelope_retry_wait(exc, attempt + 1))
                 try:
                     new_resp, account, _ = open_upstream(
@@ -5654,7 +5782,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 except Exception as reopen_exc:
                     log("reopen after envelope error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
-                    raise exc      # 以原信封错误进入既有处理路径
+                    # 以原信封错误进入既有处理路径（排队则转 429，issue #71）
+                    raise _as_rate_limited_for_queue(exc, model)
                 if cur is not resp:
                     try:
                         cur.close()
@@ -6577,6 +6706,16 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                     level="WARN", tag="chat")
                 raise InvalidToolArguments()
             elif _leaked_partial_droppable(_echo_src, allowed_names):
+                # issue #72：声明了 tools 却只拿到残缺回声 -> fail-closed（502），
+                # 不再把「空调用 + 正常内容」当成成功返回。
+                if allowed_names and _marker_only_echo(_echo_src):
+                    _kind72 = ("marker_only" if _marker_only_echo(_echo_src)
+                               else "partial_array")
+                    log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                        "tools_declared=%d) — failing the turn closed (issue #72)"
+                        % (len(_echo_src), _kind72, len(allowed_names)),
+                        level="WARN", tag="chat")
+                    raise EmptyToolEcho(len(_echo_src), _kind72)
                 # issue #9：截断的 marker+JSON 回声不还原、也不透传。
                 log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
                     % len(_echo_src), level="WARN", tag="chat")
@@ -7432,6 +7571,17 @@ def stream_responses_events(inner_lines, model, holder):
                 for c in leak_calls)
             calls_rem, clean_rem = None, leak_clean
         elif dropped_leak:
+            # issue #72：客户端声明了 tools、本轮又没恢复出任何调用时，
+            # **不能以 response.completed 收尾**（agent 会误判任务完成）。
+            _allowed72 = holder.get("allowed_names") or set()
+            if _allowed72 and _marker_only_echo(text_buffer):
+                _kind72 = ("marker_only" if _marker_only_echo(text_buffer)
+                           else "partial_array")
+                log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                    "tools_declared=%d) — failing the turn closed (issue #72)"
+                    % (len(text_buffer), _kind72, len(_allowed72)),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(text_buffer), _kind72)
             # issue #9：截断的 marker+JSON 回声 -> 不输出文本、不走 DSML 回退。
             log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
                 % len(text_buffer), level="WARN", tag="chat")
@@ -8616,6 +8766,22 @@ class Handler(BaseHTTPRequestHandler):
                 "logs": res["logs"],
                 "accounts_count": res["accounts_count"],
             })
+        if path == "/scheduler/config":
+            # issue #70 后续：/scheduler/* 走的是账号路由前缀（is_account_route），
+            # 端点必须在这里，否则会被兜底成「unknown account endpoint」。
+            if not SCHEDULER:
+                return self._error(503, "scheduler not running",
+                                   "invalid_request_error")
+            try:
+                st = SCHEDULER.set_schedule(
+                    checkin_times=(payload or {}).get("checkin_times"),
+                    keepalive_times=(payload or {}).get("keepalive_times"),
+                    cron=(payload or {}).get("cron"),
+                    jitter_secs=(payload or {}).get("jitter_secs"))
+            except Exception as exc:
+                return self._error(400, "schedule update failed: %s" % exc,
+                                   "invalid_request_error")
+            return self._json(200, {"ok": True, "scheduler": st})
         if path == "/scheduler/trigger":
             if SCHEDULER:
                 return self._json(200, SCHEDULER.trigger_now())
@@ -9177,8 +9343,9 @@ class Handler(BaseHTTPRequestHandler):
                                 attempts += 1
                                 log("responses in-stream envelope status %s "
                                     "(try %d/%d), reopening upstream"
-                                    % (exc.status, attempts + 1,
-                                       TRANSIENT_MAX_RETRIES + 1),
+                                    % (exc.status,
+                                       min(attempts + 1, _queue_budget()),
+                                       _queue_budget()),
                                     level="WARN", tag="chat")
                                 time.sleep(_envelope_retry_wait(exc, attempts))
                                 try:
@@ -9201,7 +9368,31 @@ class Handler(BaseHTTPRequestHandler):
                                         pass
                                 cur = cur2
                                 continue
-                            pump_exc = exc
+                            # issue #71：排队耗尽 -> 先试另一区（同一模型、区域级排队），
+                            # 仍不行再转成 429 + Retry-After，而不是把 403 丢给客户端。
+                            _alt71 = ("" if self.headers.get("X-Realm") else
+                                      _alt_realm_ready(req_realm, model))
+                            if _envelope_queue_wait(exc) > 0 and _alt71:
+                                log("queue exhausted -> failing over to %s (issue #71)"
+                                    % _alt71, level="WARN", tag="chat")
+                                try:
+                                    cur2, account, _ = open_upstream(
+                                        chat_req, session_key=session_key,
+                                        target_realm=_alt71,
+                                        usage_ctx=usage_ctx)
+                                except Exception as rex:
+                                    log("cross-realm reopen failed: %s"
+                                        % str(rex)[:120], level="WARN")
+                                    pump_exc = _as_rate_limited_for_queue(exc, model)
+                                    break
+                                if cur is not upstream:
+                                    try:
+                                        cur.close()
+                                    except Exception:
+                                        pass
+                                cur = cur2
+                                continue
+                            pump_exc = _as_rate_limited_for_queue(exc, model)
                             break
                 finally:
                     if cur is not upstream:
@@ -9556,8 +9747,9 @@ class Handler(BaseHTTPRequestHandler):
                                 attempts += 1
                                 log("chat in-stream envelope status %s on "
                                     "model '%s' (try %d/%d), reopening upstream"
-                                    % (exc.status, model, attempts + 1,
-                                       TRANSIENT_MAX_RETRIES + 1),
+                                    % (exc.status, model,
+                                       min(attempts + 1, _queue_budget()),
+                                       _queue_budget()),
                                     level="WARN", tag="chat")
                                 time.sleep(_envelope_retry_wait(exc, attempts))
                                 try:
@@ -9577,7 +9769,31 @@ class Handler(BaseHTTPRequestHandler):
                                         pass
                                 cur = cur2
                                 continue
-                            pump_exc = exc
+                            # issue #71：排队耗尽 -> 先试另一区（同一模型、区域级排队），
+                            # 仍不行再转成 429 + Retry-After，而不是把 403 丢给客户端。
+                            _alt71 = ("" if self.headers.get("X-Realm") else
+                                      _alt_realm_ready(req_realm, model))
+                            if _envelope_queue_wait(exc) > 0 and _alt71:
+                                log("queue exhausted -> failing over to %s (issue #71)"
+                                    % _alt71, level="WARN", tag="chat")
+                                try:
+                                    cur2, account, _ = open_upstream(
+                                        payload, session_key=session_key,
+                                        target_realm=_alt71,
+                                        usage_ctx=usage_ctx)
+                                except Exception as rex:
+                                    log("cross-realm reopen failed: %s"
+                                        % str(rex)[:120], level="WARN")
+                                    pump_exc = _as_rate_limited_for_queue(exc, model)
+                                    break
+                                if cur is not upstream:
+                                    try:
+                                        cur.close()
+                                    except Exception:
+                                        pass
+                                cur = cur2
+                                continue
+                            pump_exc = _as_rate_limited_for_queue(exc, model)
                             break
                 finally:
                     if cur is not upstream:

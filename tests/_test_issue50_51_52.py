@@ -124,11 +124,12 @@ check("#51b 嵌套 detail 里的 retryAfterSeconds 能解析出来",
       P._queue_wait_seconds(_DETAIL) == 30, P._queue_wait_seconds(_DETAIL))
 check("#51b 信封层识别排队信号", P._envelope_queue_wait(_exc) == 30)
 # issue #57 后续：预算对齐官方（分钟级）——默认允许 6 轮排队重试
-check("#51b 排队时允许多等几轮（默认 6 轮，第 7 次停止）",
-      [P.should_retry_envelope(_exc, 0, a) for a in range(8)]
-      == [True, True, True, True, True, True, False, False])
-check("#57 队列预算默认分钟级（600s / 6 轮 / 抖动 2s）",
-      P.QUEUE_WAIT_BUDGET_SECS == 600 and P.QUEUE_MAX_ROUNDS == 6
+# issue #71：默认轮次降到 3（≈90s），现场 6 轮会被拖到 3 分钟以上
+check("#51b 排队时允许多等几轮（默认 3 轮，第 4 次停止）",
+      [P.should_retry_envelope(_exc, 0, a) for a in range(5)]
+      == [True, True, True, False, False])
+check("#57 队列预算默认（600s / 3 轮 / 抖动 2s）",
+      P.QUEUE_WAIT_BUDGET_SECS == 600 and P.QUEUE_MAX_ROUNDS == 3
       and P.QUEUE_WAIT_JITTER_SECS == 2.0)
 check("#51b 重开前按 retryAfterSeconds 等待（30+1=31s）",
       P._envelope_retry_wait(_exc, 1) == 31, P._envelope_retry_wait(_exc, 1))

@@ -690,9 +690,31 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <span>后台定时调度器: <b id="schedStatusText">运行中</b></span>
       <span style="color:var(--dim);font-size:11px" id="schedTimes"></span>
     </div>
-    <div style="display:flex;gap:8px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="sec mini" onclick="toggleSchedEditor()">排程设置</button>
       <button class="sec mini" id="btnTriggerSched" onclick="triggerSchedulerNow(this)">立即巡检保活</button>
       <button class="sec mini" id="btnToggleSched" onclick="toggleScheduler(this)">暂停调度</button>
+    </div>
+    <div id="schedEditor" style="display:none;width:100%;margin-top:8px;padding-top:10px;border-top:1px dashed var(--line)">
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">
+        <div id="schedDialWrap" style="flex:0 0 auto"></div>
+        <div style="flex:1;min-width:230px;display:flex;flex-direction:column;gap:10px">
+          <div style="font-size:12px;color:var(--dim)">点圆环上的刻度选择**整点**；再点一次取消。签到与保活分开设置。</div>
+          <div id="schedSummary" style="font-size:12px;color:var(--fg)"></div>
+          <label style="font-size:12px;color:var(--dim)">账号间隔抖动
+            <input id="schJitter" placeholder="8" style="width:70px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font:inherit;color:var(--fg)">
+            秒
+          </label>
+          <details>
+            <summary style="cursor:pointer;font-size:12px;color:var(--dim)">高级：用 cron 表达式（覆盖签到时刻）</summary>
+            <input id="schCron" placeholder="0 9,21 * * *" style="width:100%;margin-top:6px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;color:var(--fg)">
+          </details>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="sec mini" onclick="saveSchedule(this)">保存排程</button>
+            <span style="font-size:11px;color:var(--dim)">保存后立即生效；时区见状态行</span>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2209,6 +2231,120 @@ async function triggerCatTravel(btn){
   }
 }
 
+
+
+// issue #70 后续：24 小时刻度圆环选时刻（取代手写 "09:00,21:00" 文本）
+const SCHED = {mode: "checkin", checkin: [], keepalive: [], jitter: 8, cron: ""};
+
+function _schedParse(times){
+  return String(times || "").split(",").map(s => s.trim()).filter(Boolean)
+    .map(s => parseInt(s.split(":")[0], 10)).filter(h => h >= 0 && h <= 23);
+}
+
+function _schedFmt(hours){
+  return Array.from(new Set(hours)).sort((a,b) => a-b)
+    .map(h => String(h).padStart(2, "0") + ":00").join(",");
+}
+
+function _dialPath(h, r1, r2, cx, cy){
+  const step = 15, pad = 1.4;
+  const a1 = (h * step + pad) * Math.PI / 180 - Math.PI / 2;
+  const a2 = ((h + 1) * step - pad) * Math.PI / 180 - Math.PI / 2;
+  const pt = (r, a) => [ (cx + r * Math.cos(a)).toFixed(2), (cy + r * Math.sin(a)).toFixed(2) ];
+  const [x1,y1] = pt(r2, a1), [x2,y2] = pt(r2, a2);
+  const [x3,y3] = pt(r1, a2), [x4,y4] = pt(r1, a1);
+  return "M" + x1 + "," + y1 + " A" + r2 + "," + r2 + " 0 0 1 " + x2 + "," + y2
+       + " L" + x3 + "," + y3 + " A" + r1 + "," + r1 + " 0 0 0 " + x4 + "," + y4 + " Z";
+}
+
+function renderSchedDial(){
+  const box = document.getElementById("schedDialWrap");
+  if(!box) return;
+  const sel = SCHED[SCHED.mode] || [];
+  const cx = 118, cy = 118, r2 = 104, r1 = 66;
+  let segs = "";
+  for(let h = 0; h < 24; h++){
+    const on = sel.indexOf(h) >= 0;
+    segs += '<path d="' + _dialPath(h, r1, r2, cx, cy) + '" '
+         + 'onclick="toggleSchedHour(' + h + ')" style="cursor:pointer;stroke:var(--line);stroke-width:1" '
+         + 'fill="' + (on ? "var(--accent)" : "var(--panel2)") + '" opacity="' + (on ? "0.9" : "0.75") + '">'
+         + '<title>' + String(h).padStart(2,"0") + ':00</title></path>';
+  }
+  let labels = "";
+  [[0,"0"],[6,"6"],[12,"12"],[18,"18"]].forEach(([h, txt]) => {
+    const a = h * 15 * Math.PI / 180 - Math.PI / 2;
+    const x = cx + 116 * Math.cos(a), y = cy + 116 * Math.sin(a) + 4;
+    labels += '<text x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" text-anchor="middle" '
+            + 'font-size="11" fill="var(--dim)">' + txt + "</text>";
+  });
+  const tabs = [["checkin","签到"], ["keepalive","保活"]].map(([k, lbl]) =>
+    '<button class="sec mini" onclick="switchSchedMode(\'' + k + '\')" '
+    + 'style="padding:3px 12px;margin-right:6px;font-size:12px'
+    + (SCHED.mode === k ? ";background:var(--accent);color:#fff;border-color:var(--accent)" : "")
+    + '">' + lbl + ' <span style="opacity:.75">' + ((SCHED[k]||[]).length) + "</span></button>"
+  ).join("");
+  box.innerHTML = '<div style="margin-bottom:6px">' + tabs + "</div>"
+    + '<svg width="236" height="236" viewBox="0 0 236 236" style="display:block">'
+    + segs + labels
+    + '<circle cx="118" cy="118" r="34" fill="none" stroke="var(--line)"></circle>'
+    + '<text x="118" y="114" text-anchor="middle" font-size="12" fill="var(--dim)">'
+    + (SCHED.mode === "checkin" ? "签到" : "保活") + "</text>"
+    + '<text x="118" y="132" text-anchor="middle" font-size="13" fill="var(--fg)" font-weight="600">'
+    + ((sel||[]).length ? String((sel||[]).length) + " 个整点" : "未选择") + "</text></svg>";
+  const sum = document.getElementById("schedSummary");
+  if(sum){
+    sum.innerHTML = "签到：<b>" + (_schedFmt(SCHED.checkin) || "未设置") + "</b>"
+      + "　　保活：<b>" + (_schedFmt(SCHED.keepalive) || "未设置") + "</b>";
+  }
+}
+
+function switchSchedMode(m){ SCHED.mode = m; renderSchedDial(); }
+
+function toggleSchedHour(h){
+  const list = SCHED[SCHED.mode] || [];
+  const i = list.indexOf(h);
+  if(i >= 0) list.splice(i, 1); else list.push(h);
+  SCHED[SCHED.mode] = list;
+  renderSchedDial();
+}
+function toggleSchedEditor(){
+  const box = document.getElementById("schedEditor");
+  if(!box) return;
+  const showing = (box.style.display === "none" || !box.style.display);
+  box.style.display = showing ? "block" : "none";
+  if(showing) renderSchedDial();
+}
+
+async function saveSchedule(btn){
+  const g = id => ((document.getElementById(id) || {}).value || "").trim();
+  const checkin = _schedFmt(SCHED.checkin);
+  const keepalive = _schedFmt(SCHED.keepalive);
+  const cron = g("schCron");
+  if(!checkin && !cron){
+    toast("请先点圆环选一个签到时刻（或填 cron）", "warn");
+    return;
+  }
+  if(!keepalive){
+    toast("请先点圆环选一个保活时刻", "warn");
+    return;
+  }
+  if(btn){ btn.disabled = true; btn.textContent = "保存中…"; }
+  try{
+    const r = await postJSON("/scheduler/config", {
+      checkin_times: checkin,
+      keepalive_times: keepalive,
+      cron: cron,
+      jitter_secs: g("schJitter"),
+    });
+    const s = r.scheduler || {};
+    toast("排程已保存：签到 " + (s.checkin_times || "-") + " · 保活 " + (s.keepalive_times || "-"), "ok");
+    loadSchedulerStatus();
+  }catch(e){
+    toast("保存失败: " + ((e && e.message) || e), "bad");
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = "保存排程"; }
+  }
+}
 async function loadSchedulerStatus(){
   try{
     const s = await getJSON("/scheduler");
@@ -2225,7 +2361,25 @@ async function loadSchedulerStatus(){
       ? (s.mode_intl || '账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)')
       : (s.mode_cn || s.mode || '整点排程');
     if(txt) txt.textContent = s.enabled ? ('运行中 · ' + modeText) : '已暂停';
-    if(times) times.textContent = '上次: ' + (s.last_run_time || '-') + ' · 下次: ' + (s.next_run_time || '-');
+    if(times){
+      // issue #70：把排程时刻与时区摆出来——容器跑 UTC 时一眼能看出对不上
+      times.textContent = '签到 ' + (s.checkin_times || '-')
+        + ' · 保活 ' + (s.keepalive_times || '-')
+        + (s.cron ? (' · cron ' + s.cron) : '')
+        + ' · 时区 ' + (s.timezone || '-')
+        + ' · 上次 ' + (s.last_run_time || '-')
+        + ' · 下次 ' + (s.next_run_time || '-');
+      // issue #70 后续：从服务端同步到圆环状态（保留用户正在编辑的选择）
+      if(!window._schedDirty){
+        SCHED.checkin = _schedParse(s.checkin_times);
+        SCHED.keepalive = _schedParse(s.keepalive_times);
+        const cr = document.getElementById('schCron');
+        if(cr) cr.value = s.cron || '';
+        const jt = document.getElementById('schJitter');
+        if(jt) jt.value = s.jitter_secs != null ? String(s.jitter_secs) : '';
+        renderSchedDial();
+      }
+    }
     if(btn) btn.textContent = s.enabled ? '暂停调度' : '启用调度';
     // 按钮文案固定「立即巡检保活」：巡检同时覆盖两个区域（保活+签到+积分），
   // 按当前视图改文案只会让人以为「切区后动作不同」。
